@@ -1,4 +1,4 @@
-# Veno Twitch Stability Fork 1.0.1 — patch notes
+# Veno Twitch Stability Fork 1.0.2 — patch notes
 
 ## Base
 
@@ -27,10 +27,23 @@ Derived from the user-supplied TwitchAdSolutions VAFT v93 snapshot under the MIT
 - Prefers video nodes inside `.video-player` before the whole-page fallback when React player discovery is temporarily unavailable.
 - Prevents the tab-focus recovery handler from resuming playback when explicit user-pause intent is recorded.
 
+## New in 1.0.2
+
+- Reuses the prefetched Twitch worker source instead of refetching a Blob URL that Twitch may already have revoked; only script-owned replacement Blobs are cleaned up.
+- Bounds auxiliary health probes, backup master/media fetches, the full backup search, and worker GraphQL body reads so optional recovery work cannot hold playback forever.
+- Rejects malformed/non-HLS backup responses, missing variant URLs, and ad-marked candidates during the short post-reload single-probe mode.
+- Keeps exactly one buffer-monitor timer across visibility changes and ignores messages, proxy responses, and crash events from replaced workers.
+- Gives confirmed worker-crash and post-break-wedge recovery an explicit hard-reload path while enforcing a main-thread 15-second gate on every automatic early reload, including across worker replacement.
+- Makes the required no-strip post-ad transition a soft reload even when ordinary health metrics look good, while retaining the healthy-player guard for optional early recovery.
+- Clears transient monitor/recovery state on channel changes, refreshes disconnected React/player roots, avoids whole-document video fallbacks, and restores script-hidden video/overlay state on excluded SPA routes.
+- Fixes mixed ad/live recovery media-sequence math, backup pin opt-out, no-strip soft reload selection, and end-of-break state ordering.
+- Discards a stale asynchronous backup search before it can strip, mutate recovery state, or request a reload, and clamps untrusted ad-pod reload budgets to 1-8.
+- Extends live-only route protection to official chat embeds and collection-only VOD embeds, with dynamic suppression after live-to-VOD/chat/clip SPA navigation.
+
 ## Deliberate non-goals
 
 - No claim of permanent ad removal.
 - No VOD or clip interception.
 - No attempt to impersonate ad-view completion.
-- No automatic publication or remote update channel.
+- No self-updater. A moving `main` raw URL changes only when this repository is deliberately pushed; a commit-pinned URL stays frozen.
 - No stacking with another Twitch-specific blocker.

@@ -1,13 +1,14 @@
 veno-twitch-stable.js text/javascript
 /*
- * Veno Twitch Stability Fork 1.0.1
+ * Veno Twitch Stability Fork 1.0.2
  * Based on the user-supplied TwitchAdSolutions VAFT v93 snapshot.
  * Copyright (c) 2020-present TwitchAdSolutions Contributors.
  * Modifications copyright (c) 2026.
  * Licensed under the MIT License; see LICENSE.txt in the distribution.
  *
  * Design goal: block Twitch live-stream ads while failing open rather than
- * indefinitely wedging playback. VOD and chat-only routes are out of scope.
+ * indefinitely wedging playback. VOD, collection-only, clip, and chat-only
+ * routes are out of scope.
  * Twitch can change its player or ad delivery at any time; no permanent
  * effectiveness or compatibility guarantee is possible.
  */
@@ -15,14 +16,25 @@ veno-twitch-stable.js text/javascript
     if ( /(^|\.)twitch\.tv$/.test(document.location.hostname) === false ) { return; }
 
     // Veno stability boundary: this fork is for live-channel video only.
-    // VOD playback and chat-only popouts do not need player-worker interception, so
+    // VOD/collection playback, clips, and chat-only embeds/popouts do not need interception, so
     // leave them entirely untouched instead of risking collateral player/chat breakage.
+    // Keep this predicate dynamic: Twitch is an SPA, so a document which began on a
+    // live channel can later host a VOD/clip/chat route without being reloaded.
+    function isVenoPlaybackContextAllowed() {
+        const host = document.location.hostname;
+        const path = document.location.pathname || '';
+        const params = new URLSearchParams(document.location.search || '');
+        const hasLiveChannel = !!params.get('channel')?.trim();
+        // Twitch documents that `channel` wins when it is combined with video/collection.
+        const isVod = /^\/videos\/\d+(?:\/|$)/.test(path)
+            || (!hasLiveChannel && (params.has('video') || params.has('collection')));
+        const isChatOnly = /^\/(?:popout\/[^/]+|embed\/[^/]+)\/chat(?:\/|$)/.test(path)
+            || (host === 'embed.twitch.tv' && /\/chat(?:\/|$)/.test(path));
+        const isClip = host === 'clips.twitch.tv' || /^\/[^/]+\/clip\/[^/]+/.test(path);
+        return !isVod && !isChatOnly && !isClip;
+    }
     const _venoRoutePath = document.location.pathname || '';
-    const _venoIsVodRoute = /^\/videos\/\d+/.test(_venoRoutePath)
-        || new URLSearchParams(document.location.search || '').has('video');
-    const _venoIsChatOnlyRoute = /\/chat(?:\/|$)/.test(_venoRoutePath)
-        && (_venoRoutePath.includes('/popout/') || document.location.hostname === 'embed.twitch.tv');
-    if (_venoIsVodRoute || _venoIsChatOnlyRoute) {
+    if (!isVenoPlaybackContextAllowed()) {
         console.log('[AD DEBUG] Veno stability fork skipped — non-live route: ' + _venoRoutePath);
         return;
     }
@@ -35,12 +47,15 @@ veno-twitch-stable.js text/javascript
     // (https://dev.twitch.tv/docs/embed/video-and-clips/) — preserves Twitch streams
     // embedded on third-party sites where vaft runs in an iframe whose parent is on
     // a different origin.
-    // Use window.frameElement to detect nested frames — null on top frame, the iframe
-    // element on a same-origin nested frame, throws on a cross-origin nested frame.
-    // More reliable than 'window !== window.top' because Tampermonkey wraps window in a
-    // proxy where the strict comparison can return true even on the top frame.
+    // Window.frameElement is null for BOTH top-level and cross-origin framed documents,
+    // so it cannot safely distinguish Twitch's hidden cross-origin auxiliary frames.
+    // WindowProxy identity comparison is cross-origin-safe and does distinguish them.
     let _isNested = false;
-    try { _isNested = window.frameElement !== null; } catch (_e) { _isNested = true; }
+    try {
+        _isNested = typeof window.top === 'undefined'
+            ? window.frameElement !== null
+            : window.self !== window.top;
+    } catch (_e) { _isNested = true; }
     if (_isNested) {
         const _host = document.location.hostname;
         const _isEmbedContext = _host === 'player.twitch.tv' || _host === 'embed.twitch.tv' || document.location.pathname.startsWith('/embed/');
@@ -64,8 +79,8 @@ veno-twitch-stable.js text/javascript
     'use strict';
     // Numeric value deliberately exceeds upstream v93 so a second VAFT/TwitchAdSolutions
     // resource cannot double-hook the same player. Use only one Twitch-specific script.
-    const ourTwitchAdSolutionsVersion = 9301001;
-    const venoTwitchStabilityVersion = '1.0.1';
+    const ourTwitchAdSolutionsVersion = 9301002;
+    const venoTwitchStabilityVersion = '1.0.2';
     // Stability rule: never layer this over any existing VAFT/TwitchAdSolutions hook,
     // regardless of version or load order. Two player-worker controllers are less safe
     // than allowing the already-active resource to keep control.
@@ -126,8 +141,9 @@ veno-twitch-stable.js text/javascript
         scope.EarlyReloadPollThreshold = 5;// Stability default: wait roughly 10s before a bounded early reload; override via localStorage twitchAdSolutions_earlyReloadPollThreshold.
         scope.PinBackupPlayerType = true;// Remember which backup player type worked and try it first on next ad break
         scope.PlayerReloadMinimalRequestsTime = 1500;
-        scope.PlayerReloadMinimalRequestsPlayerIndex = 2;//autoplay
+        scope.PlayerReloadMinimalRequestsFallbackType = 'site';// Named fallback used only during the short post-reload single-probe window.
         scope.HasTriggeredPlayerReload = false;
+        scope.VenoPlaybackAllowed = true;// Main thread flips this off when an initialized Twitch SPA enters an excluded route.
         scope.StreamInfos = Object.create(null);
         scope.StreamInfosByUrl = Object.create(null);
         scope.GQLDeviceID = null;
@@ -149,6 +165,8 @@ veno-twitch-stable.js text/javascript
         scope.AdSegmentCache = new Map();
         scope.AllSegmentsAreAdSegments = false;
         scope.StreamInfoMaxAgeMs = 30 * 60 * 1000;
+        scope.AuxiliaryFetchTimeoutMs = 4000;// Bound each health/backup fetch, including playlist body consumption.
+        scope.BackupSearchDeadlineMs = 8000;// Bound the complete backup search so playlist delivery cannot wedge indefinitely.
     }
     function pruneStreamInfos() {
         const now = Date.now();
@@ -246,7 +264,10 @@ veno-twitch-stable.js text/javascript
     let isActivelyStrippingAds = false;
     let localStorageHookFailed = false;
     const twitchWorkers = [];
+    let activeTwitchWorkerGeneration = 0;
+    let pendingWorkerCrashRecovery = null;
     const hiddenAdVideoState = new WeakMap();// Exact pre-hide state for Twitch-recycled <video> nodes.
+    const hiddenAdOverlayState = new WeakMap();// Exact pre-hide display state for Twitch-recycled SDA wrappers.
     let cachedRootNode = null;// Cached #root DOM element (never changes in React SPAs)
     let cachedPlayerRootDiv = null;// Cached .video-player element
     // One-shot flags for overlay-hide logs. Twitch's React tree re-mounts SDA
@@ -343,6 +364,11 @@ veno-twitch-stable.js text/javascript
                     console.log('[AD DEBUG] Non-Twitch worker skipped: ' + twitchBlobUrl);
                     return;
                 }
+                if (!isVenoPlaybackContextAllowed()) {
+                    super(twitchBlobUrl, options);
+                    console.log('[AD DEBUG] Twitch worker left unmodified — current route is outside live-playback scope');
+                    return;
+                }
                 // Pre-check: verify we can fetch the worker JS before injecting
                 let prefetchedWorkerJs = null;
                 try { prefetchedWorkerJs = getWasmWorkerJs(twitchBlobUrl); } catch {}
@@ -364,6 +390,13 @@ veno-twitch-stable.js text/javascript
                         return;
                     }
                 }
+                // Reuse the source already read synchronously above. Refetching twitchBlobUrl
+                // from inside the bootloader races Twitch revoking its original Blob URL after
+                // this constructor returns, which can leave an empty worker that silently runs
+                // none of Twitch's playback code.
+                const serializedWorkerJs = JSON.stringify(prefetchedWorkerJs)
+                    .replace(/\u2028/g, '\\u2028')
+                    .replace(/\u2029/g, '\\u2029');
                 const newBlobStr = `
                     const pendingFetchRequests = new Map();
                     ${hasAdTags.toString()}
@@ -372,18 +405,20 @@ veno-twitch-stable.js text/javascript
                     ${stripAdSegments.toString()}
                     ${videoCodecFamily.toString()}
                     ${getStreamUrlForResolution.toString()}
+                    ${awaitWithDeadline.toString()}
+                    ${fetchAuxiliaryWithDeadline.toString()}
+                    ${isUsableHlsPlaylist.toString()}
                     ${processM3U8.toString()}
                     ${hookWorkerFetch.toString()}
                     ${declareOptions.toString()}
                     ${getAccessToken.toString()}
                     ${gqlRequest.toString()}
                     ${parseAttributes.toString()}
-                    ${getWasmWorkerJs.toString()}
                     ${getServerTimeFromM3u8.toString()}
                     ${replaceServerTimeInM3u8.toString()}
                     ${pruneStreamInfos.toString()}
                     ${createStreamInfo.toString()}
-                    const workerString = getWasmWorkerJs('${twitchBlobUrl.replaceAll("'", "%27")}');
+                    const workerString = ${serializedWorkerJs};
                     declareOptions(self);
                     if (!self.__tasPruneInterval) {
                         self.__tasPruneInterval = setInterval(pruneStreamInfos, 5 * 60 * 1000);
@@ -398,27 +433,32 @@ veno-twitch-stable.js text/javascript
                     BackupSwapFirst = ${BackupSwapFirst};
                     DisableAdSpoofing = ${DisableAdSpoofing};
                     SoftReloadNoStrip = ${SoftReloadNoStrip};
-                    ForceAccessTokenPlayerType = '${ForceAccessTokenPlayerType}';
-                    GQLDeviceID = ${GQLDeviceID ? "'" + GQLDeviceID + "'" : null};
-                    AuthorizationHeader = ${AuthorizationHeader ? "'" + AuthorizationHeader + "'" : undefined};
-                    ClientIntegrityHeader = ${ClientIntegrityHeader ? "'" + ClientIntegrityHeader + "'" : null};
-                    ClientVersion = ${ClientVersion ? "'" + ClientVersion + "'" : null};
-                    ClientSession = ${ClientSession ? "'" + ClientSession + "'" : null};
+                    ForceAccessTokenPlayerType = ${JSON.stringify(ForceAccessTokenPlayerType)};
+                    GQLDeviceID = ${JSON.stringify(GQLDeviceID)};
+                    AuthorizationHeader = ${JSON.stringify(AuthorizationHeader)};
+                    ClientIntegrityHeader = ${JSON.stringify(ClientIntegrityHeader)};
+                    ClientVersion = ${JSON.stringify(ClientVersion)};
+                    ClientSession = ${JSON.stringify(ClientSession)};
                     self.addEventListener('message', function(e) {
-                        if (e.data.key == 'UpdateClientVersion') {
-                            ClientVersion = e.data.value;
-                        } else if (e.data.key == 'UpdateClientSession') {
-                            ClientSession = e.data.value;
-                        } else if (e.data.key == 'UpdateClientId') {
-                            ClientID = e.data.value;
-                        } else if (e.data.key == 'UpdateDeviceId') {
-                            GQLDeviceID = e.data.value;
-                        } else if (e.data.key == 'UpdateClientIntegrityHeader') {
-                            ClientIntegrityHeader = e.data.value;
-                        } else if (e.data.key == 'UpdateAuthorizationHeader') {
-                            AuthorizationHeader = e.data.value;
-                        } else if (e.data.key == 'FetchResponse') {
-                            const responseData = e.data.value;
+                        const message = e && e.data;
+                        if (!message || typeof message !== 'object') return;
+                        if (message.key == 'UpdateClientVersion') {
+                            ClientVersion = message.value;
+                        } else if (message.key == 'UpdateClientSession') {
+                            ClientSession = message.value;
+                        } else if (message.key == 'UpdateClientId') {
+                            ClientID = message.value;
+                        } else if (message.key == 'UpdateDeviceId') {
+                            GQLDeviceID = message.value;
+                        } else if (message.key == 'UpdateClientIntegrityHeader') {
+                            ClientIntegrityHeader = message.value;
+                        } else if (message.key == 'UpdateAuthorizationHeader') {
+                            AuthorizationHeader = message.value;
+                        } else if (message.key == 'UpdateRouteAllowed') {
+                            VenoPlaybackAllowed = message.value === true;
+                        } else if (message.key == 'FetchResponse') {
+                            const responseData = message.value;
+                            if (!responseData || typeof responseData !== 'object') return;
                             if (pendingFetchRequests.has(responseData.id)) {
                                 const { resolve, reject, timeoutId } = pendingFetchRequests.get(responseData.id);
                                 clearTimeout(timeoutId);
@@ -443,9 +483,9 @@ veno-twitch-stable.js text/javascript
                                     resolve(response);
                                 }
                             }
-                        } else if (e.data.key == 'TriggeredPlayerReload') {
+                        } else if (message.key == 'TriggeredPlayerReload') {
                             HasTriggeredPlayerReload = true;
-                        } else if (e.data.key == 'ReloadSkipped') {
+                        } else if (message.key == 'ReloadSkipped') {
                             // Main thread refused the reload (player healthy) — clear early-reload
                             // flags so we can re-fire if the player later stalls. Without this,
                             // EarlyReloadTriggered / EarlyReloadAwaitingResult stay set after a
@@ -463,10 +503,10 @@ veno-twitch-stable.js text/javascript
                             if (cleared) {
                                 console.log('[AD DEBUG] Reload skipped by main thread (player healthy) — early reload state cleared, can retry');
                             }
-                        } else if (e.data.key == 'SimulateAds') {
-                            SimulatedAdsDepth = e.data.value;
+                        } else if (message.key == 'SimulateAds') {
+                            SimulatedAdsDepth = message.value;
                             console.log('SimulatedAdsDepth: ' + SimulatedAdsDepth);
-                        } else if (e.data.key == 'AllSegmentsAreAdSegments') {
+                        } else if (message.key == 'AllSegmentsAreAdSegments') {
                             AllSegmentsAreAdSegments = !AllSegmentsAreAdSegments;
                             console.log('AllSegmentsAreAdSegments: ' + AllSegmentsAreAdSegments);
                         }
@@ -488,36 +528,52 @@ veno-twitch-stable.js text/javascript
                     injectedBlobUrl = URL.createObjectURL(new Blob([newBlobStr]));
                     super(injectedBlobUrl, options);
                 }
+                const workerGeneration = ++activeTwitchWorkerGeneration;
+                // A verified replacement makes any deferred recovery belonging to the
+                // previous generation obsolete.
+                pendingWorkerCrashRecovery = null;
                 twitchWorkers.length = 0;
                 twitchWorkers.push(this);
+                const isCurrentTwitchWorker = () => twitchWorkers[0] === this
+                    && activeTwitchWorkerGeneration === workerGeneration;
                 this.addEventListener('message', (e) => {
-                    if (e.data.key == 'UpdateAdBlockBanner') {
-                        updateAdblockBanner(e.data);
+                    if (!isCurrentTwitchWorker()) return;
+                    const message = e && e.data;
+                    if (!message || typeof message !== 'object') return;
+                    if (message.key == 'UpdateAdBlockBanner') {
+                        const hasAds = isVenoPlaybackContextAllowed() && !!message.hasAds;
+                        updateAdblockBanner({
+                            ...message,
+                            hasAds,
+                            isStrippingAdSegments: hasAds && !!message.isStrippingAdSegments
+                        });
                         // Track backup stream switches (start and end of ad break)
-                        if (e.data.hasAds !== !!playerBufferState.inAdBreak) {
+                        if (hasAds !== !!playerBufferState.inAdBreak) {
                             playerBufferState.lastBackupSwitchAt = Date.now();
                             // Reset position tracking on ad-end so the stream switch gap isn't detected as a jump
-                            if (!e.data.hasAds) {
+                            if (!hasAds) {
                                 playerBufferState.position = 0;
                             }
                         }
-                        playerBufferState.inAdBreak = !!e.data.hasAds;
+                        playerBufferState.inAdBreak = hasAds;
                         // Clear drift catch-up when ads start — don't run 1.1x during ad handling
-                        if (e.data.hasAds && (driftCatchUpInterval || driftCatchUpTimeout)) {
-                            if (driftCatchUpInterval) { clearInterval(driftCatchUpInterval); driftCatchUpInterval = null; }
-                            if (driftCatchUpTimeout) { clearTimeout(driftCatchUpTimeout); driftCatchUpTimeout = null; }
-                            try { getPlayerVideoElement().playbackRate = 1.0; } catch {}
+                        if (hasAds && (driftCatchUpInterval || driftCatchUpTimeout)) {
+                            stopDriftCorrection();
                         }
-                    } else if (e.data.key == 'PauseResumePlayer') {
+                    } else if (message.key == 'PauseResumePlayer') {
                         doTwitchPlayerTask(true, false);
-                    } else if (e.data.key == 'ReloadPlayer') {
-                        doTwitchPlayerTask(false, true, e.data.kind);
+                    } else if (message.key == 'ReloadPlayer') {
+                        doTwitchPlayerTask(false, true, message.kind);
                     }
                 });
                 this.addEventListener('message', async event => {
-                    if (event.data.key == 'FetchRequest') {
-                        const fetchRequest = event.data.value;
+                    if (!isCurrentTwitchWorker()) return;
+                    const message = event && event.data;
+                    if (!message || typeof message !== 'object') return;
+                    if (message.key == 'FetchRequest') {
+                        const fetchRequest = message.value;
                         const responseData = await handleWorkerFetchRequest(fetchRequest);
+                        if (!isCurrentTwitchWorker()) return;
                         this.postMessage({
                             key: 'FetchResponse',
                             value: responseData
@@ -531,13 +587,48 @@ veno-twitch-stable.js text/javascript
                 // as part of the new player instance, and existing reload cooldown
                 // prevents runaway restart loops.
                 let crashed = false;
-                this.addEventListener('error', (e) => {
-                    if (crashed) return;
-                    crashed = true;
-                    console.log('[AD DEBUG] IVS WASM worker crashed: ' + ((e && e.message) || 'unknown error') + ' — triggering hard reload to recover');
-                    try { doTwitchPlayerTask(false, true, 'early'); } catch (err) {
+                let loggedCrashCooldown = false;
+                let nextCrashRecoveryAttemptAt = 0;
+                const recoverCrashedWorker = () => {
+                    if (!isCurrentTwitchWorker()) {
+                        if (pendingWorkerCrashRecovery === recoverCrashedWorker) pendingWorkerCrashRecovery = null;
+                        return;
+                    }
+                    if (Date.now() < nextCrashRecoveryAttemptAt) return;
+                    const cooldownRemaining = playerBufferState.lastReloadAt
+                        ? 15000 - (Date.now() - playerBufferState.lastReloadAt)
+                        : 0;
+                    if (cooldownRemaining > 0) {
+                        if (!loggedCrashCooldown) {
+                            loggedCrashCooldown = true;
+                            console.log('[AD DEBUG] Worker crash recovery deferred for ' + cooldownRemaining + 'ms by reload cooldown');
+                        }
+                        nextCrashRecoveryAttemptAt = Date.now() + cooldownRemaining;
+                        return;
+                    }
+                    // User pause, PiP, route transitions, and temporarily missing player state
+                    // are not permanent failures. The single existing player monitor invokes
+                    // this callback again; no second polling loop is created.
+                    if (playerBufferState.userPauseIntent || document.pictureInPictureElement) {
+                        nextCrashRecoveryAttemptAt = Date.now() + 2000;
+                        return;
+                    }
+                    let recoveryStarted = false;
+                    try { recoveryStarted = doTwitchPlayerTask(false, true, 'early', { force: true, reason: 'worker-crash' }) === true; } catch (err) {
                         console.log('[AD DEBUG] Worker crash recovery failed: ' + err.message);
                     }
+                    if (recoveryStarted && pendingWorkerCrashRecovery === recoverCrashedWorker) {
+                        pendingWorkerCrashRecovery = null;
+                    } else {
+                        nextCrashRecoveryAttemptAt = Date.now() + 2000;
+                    }
+                };
+                this.addEventListener('error', (e) => {
+                    if (crashed || !isCurrentTwitchWorker()) return;
+                    crashed = true;
+                    console.log('[AD DEBUG] IVS WASM worker crashed: ' + ((e && e.message) || 'unknown error') + ' — triggering hard reload to recover');
+                    pendingWorkerCrashRecovery = recoverCrashedWorker;
+                    recoverCrashedWorker();
                 });
             }
         };
@@ -577,6 +668,61 @@ veno-twitch-stable.js text/javascript
         }
         return text;
     }
+    function awaitWithDeadline(promise, deadlineAt, label, onTimeout) {
+        const remainingMs = Math.floor(deadlineAt - Date.now());
+        const makeTimeoutError = () => {
+            const error = new Error(label + ' timed out');
+            error.name = 'TimeoutError';
+            error.code = 'TAS_DEADLINE';
+            return error;
+        };
+        if (remainingMs <= 0) {
+            try { if (onTimeout) onTimeout(); } catch {}
+            return Promise.reject(makeTimeoutError());
+        }
+        return new Promise((resolve, reject) => {
+            let settled = false;
+            const timeoutId = setTimeout(() => {
+                if (settled) return;
+                settled = true;
+                try { if (onTimeout) onTimeout(); } catch {}
+                reject(makeTimeoutError());
+            }, remainingMs);
+            Promise.resolve(promise).then(value => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timeoutId);
+                resolve(value);
+            }, error => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timeoutId);
+                reject(error);
+            });
+        });
+    }
+    function fetchAuxiliaryWithDeadline(realFetch, input, init, deadlineAt, readBody, label) {
+        const controller = new AbortController();
+        const overallDeadline = Number.isFinite(deadlineAt)
+            ? deadlineAt
+            : Date.now() + AuxiliaryFetchTimeoutMs;
+        const requestDeadline = Math.min(overallDeadline, Date.now() + AuxiliaryFetchTimeoutMs);
+        const requestInit = { ...(init || {}), signal: controller.signal };
+        const operation = (async () => {
+            const response = await realFetch(input, requestInit);
+            const body = readBody ? await response.text() : null;
+            return { response, body };
+        })();
+        return awaitWithDeadline(operation, requestDeadline, label || 'Auxiliary fetch', () => controller.abort());
+    }
+    function isUsableHlsPlaylist(text, kind) {
+        if (typeof text !== 'string') return false;
+        const normalized = text.trimStart();
+        if (!normalized.startsWith('#EXTM3U')) return false;
+        if (kind === 'master') return normalized.includes('#EXT-X-STREAM-INF:');
+        if (kind === 'media') return normalized.includes('#EXTINF:') || normalized.includes('#EXT-X-PART:');
+        return true;
+    }
     // Hook fetch() in the worker scope to intercept m3u8 playlist requests and ad segments
     function hookWorkerFetch() {
         console.log('[AD DEBUG] hookWorkerFetch (vaft)');
@@ -603,6 +749,7 @@ veno-twitch-stable.js text/javascript
             return replacement;
         };
         fetch = async function(url, options) {
+            if (!VenoPlaybackAllowed) return realFetch.apply(this, arguments);
             if (typeof url === 'string') {
                 if (AdSegmentCache.has(url)) {
                     return new Response(BLANK_MP4);
@@ -612,8 +759,20 @@ veno-twitch-stable.js text/javascript
                     return new Promise(function(resolve, reject) {
                         const processAfter = async function(response) {
                             if (response.status === 200) {
-                                const originalText = await response.clone().text();
+                                const originalText = await awaitWithDeadline(
+                                    response.clone().text(),
+                                    Date.now() + AuxiliaryFetchTimeoutMs,
+                                    'Media playlist body read'
+                                );
+                                if (!VenoPlaybackAllowed) {
+                                    resolve(response);
+                                    return;
+                                }
                                 const processedText = await processM3U8(url, originalText, realFetch);
+                                if (!VenoPlaybackAllowed) {
+                                    resolve(response);
+                                    return;
+                                }
                                 resolve(responseWithBody(response, processedText));
                             } else {
                                 resolve(response);
@@ -640,7 +799,15 @@ veno-twitch-stable.js text/javascript
                     return new Promise(function(resolve, reject) {
                         const processAfter = async function(response) {
                             if (response.status == 200) {
-                                const encodingsM3u8 = await response.clone().text();
+                                const encodingsM3u8 = await awaitWithDeadline(
+                                    response.clone().text(),
+                                    Date.now() + AuxiliaryFetchTimeoutMs,
+                                    'Master playlist body read'
+                                );
+                                if (!VenoPlaybackAllowed) {
+                                    resolve(response);
+                                    return;
+                                }
                                 const serverTime = getServerTimeFromM3u8(encodingsM3u8);
                                 let streamInfo = StreamInfos[channelName];
                                 if (streamInfo != null && streamInfo.EncodingsM3U8 != null
@@ -653,10 +820,33 @@ veno-twitch-stable.js text/javascript
                                         || streamInfo.EncodingsM3U8.match(/^https?:\/\/[^\r\n]+/m)?.[0];
                                     if (probeUrl) {
                                         try {
-                                            const probeResponse = await realFetch(probeUrl, { cache: 'no-store' });
+                                            const probeResult = await fetchAuxiliaryWithDeadline(
+                                                realFetch,
+                                                probeUrl,
+                                                { cache: 'no-store' },
+                                                Date.now() + AuxiliaryFetchTimeoutMs,
+                                                false,
+                                                'Master health probe'
+                                            );
+                                            const probeResponse = probeResult.response;
+                                            // We only need status for this health check. Explicitly cancel the
+                                            // unused body so repeated probes don't retain response streams.
+                                            try {
+                                                const cancelResult = probeResponse.body?.cancel?.();
+                                                if (cancelResult && typeof cancelResult.catch === 'function') cancelResult.catch(() => {});
+                                            } catch {}
+                                            if (!VenoPlaybackAllowed) {
+                                                resolve(response);
+                                                return;
+                                            }
                                             if (!probeResponse.ok) streamInfo = null;
-                                        } catch {
-                                            streamInfo = null;
+                                        } catch (error) {
+                                            // The fresh master response is still valid and unread. If the
+                                            // optional health probe stalls/fails, return it untouched instead
+                                            // of delaying playback or rebuilding it from stale session state.
+                                            console.log('[AD DEBUG] Master health probe failed open: ' + error.message);
+                                            resolve(response);
+                                            return;
                                         }
                                     }
                                 }
@@ -917,6 +1107,7 @@ veno-twitch-stable.js text/javascript
         let hasStrippedAdSegments = false;
         let inCueOut = false;
         const liveSegments = [];
+        let mediaSegmentOrdinal = 0;
         const lines = textStr.split(/\r?\n/);
         const newAdUrl = 'https://twitch.tv';
         // Log ad tracking attribute names once per stream (helps identify new beacons)
@@ -967,21 +1158,24 @@ veno-twitch-stable.js text/javascript
             }
             // Remove tracking urls which appear in the overlay UI
             lines[i] = line.replaceAll(TwitchAdUrlRewriteRegex, `$1${newAdUrl}$2`);
+            const isMediaSegment = line.startsWith('#EXTINF');
+            const segmentOrdinal = mediaSegmentOrdinal;
+            if (isMediaSegment) mediaSegmentOrdinal++;
             const isLiveSegment = line.includes(',live');
-            if (i < lines.length - 1 && line.startsWith('#EXTINF') && (!isLiveSegment || stripAllSegments || AllSegmentsAreAdSegments || inCueOut)) {
+            if (i < lines.length - 1 && isMediaSegment && (!isLiveSegment || stripAllSegments || AllSegmentsAreAdSegments || inCueOut)) {
                 const segmentUrl = lines[i + 1];
                 if (!AdSegmentCache.has(segmentUrl)) {
                     streamInfo.NumStrippedAdSegments++;
                 }
                 AdSegmentCache.set(segmentUrl, Date.now());
                 hasStrippedAdSegments = true;
-            } else if (i < lines.length - 1 && line.startsWith('#EXTINF') && AdSegmentURLPatterns.some((p) => lines[i + 1].includes(p))) {
+            } else if (i < lines.length - 1 && isMediaSegment && AdSegmentURLPatterns.some((p) => lines[i + 1].includes(p))) {
                 console.log('[AD DEBUG] Ad segment detected via URL pattern: ' + lines[i + 1]);
                 AdSegmentCache.set(lines[i + 1], Date.now());
                 hasStrippedAdSegments = true;
                 streamInfo.NumStrippedAdSegments++;
-            } else if (i < lines.length - 1 && line.startsWith('#EXTINF') && isLiveSegment) {
-                liveSegments.push({ extinf: line, url: lines[i + 1] });
+            } else if (i < lines.length - 1 && isMediaSegment && isLiveSegment) {
+                liveSegments.push({ extinf: line, url: lines[i + 1], ordinal: segmentOrdinal });
             } else if (line.startsWith('#EXT-X-PART:')) {
                 // LL-HLS part: URI is inline as an attribute. Strip if it matches a known
                 // ad URL (already in cache from a parallel EXTINF strip, or matches a URL pattern).
@@ -1040,8 +1234,12 @@ veno-twitch-stable.js text/javascript
         if (liveSegments.length > 0) {
             streamInfo.RecoverySegments = liveSegments.slice(-6);
             const seq = parseInt((textStr.match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/) || [])[1]);
-            if (!isNaN(seq)) {
-                streamInfo.RecoveryStartSeq = seq + Math.max(0, liveSegments.length - streamInfo.RecoverySegments.length);
+            const firstRecoveryOrdinal = streamInfo.RecoverySegments[0]?.ordinal;
+            if (!isNaN(seq) && Number.isInteger(firstRecoveryOrdinal)) {
+                // MEDIA-SEQUENCE counts every full media segment, including stripped ad
+                // segments. liveSegments.length alone loses that ordinal when ads and live
+                // entries are interleaved, assigning recovery content the wrong sequence.
+                streamInfo.RecoveryStartSeq = seq + firstRecoveryOrdinal;
             }
         }
         // If all segments were stripped, try to prevent black screen via recovery content.
@@ -1170,6 +1368,7 @@ veno-twitch-stable.js text/javascript
     }
     // Core ad-blocking logic: detect ads in m3u8, fetch backup streams, strip ad segments
     async function processM3U8(url, textStr, realFetch) {
+        if (!VenoPlaybackAllowed) return textStr;
         const streamInfo = StreamInfosByUrl[url];
         if (!streamInfo) {
             return textStr;
@@ -1228,7 +1427,11 @@ veno-twitch-stable.js text/javascript
                 streamInfo.BreakGeneration = (streamInfo.BreakGeneration || 0) + 1;
                 streamInfo.AdBreakStartedAt = Date.now();
                 const podLengthMatch = textStr.match(/X-TV-TWITCH-AD-POD-LENGTH="(\d+)"/);
-                const podLength = podLengthMatch ? parseInt(podLengthMatch[1], 10) : 1;
+                const parsedPodLength = podLengthMatch ? parseInt(podLengthMatch[1], 10) : 1;
+                // Treat pod metadata as untrusted input. It controls a worker-local recovery
+                // budget, so an implausibly large value must not permit an equally large
+                // number of automatic reload requests.
+                const podLength = Math.min(8, Math.max(1, Number.isFinite(parsedPodLength) ? parsedPodLength : 1));
                 // Reset early-reload state for new ad break; allow up to one early reload per ad in pod
                 streamInfo.PodLength = podLength;
                 streamInfo.EarlyReloadTriggered = false;
@@ -1382,19 +1585,24 @@ veno-twitch-stable.js text/javascript
                 });
                 return textStr;
             }
+            const backupSearchInputM3u8 = textStr;
             const backupSearchStart = Date.now();
+            const backupSearchDeadlineAt = backupSearchStart + BackupSearchDeadlineMs;
             const backupSearchGeneration = streamInfo.BreakGeneration;
             let backupColdTokenFetches = 0;// diag: cold-cache token round-trips this backup search (0 = warm — encodings cache hit)
             let backupPlayerType = null;
             let backupM3u8 = null;
             let fallbackM3u8 = null;
-            let startIndex = 0;
             let isDoingMinimalRequests = false;
-            if (streamInfo.LastPlayerReload > Date.now() - PlayerReloadMinimalRequestsTime) {
-                // When doing player reload there are a lot of requests which causes the backup stream to load in slow. Briefly prefer using a single version to prevent long delays
-                startIndex = PlayerReloadMinimalRequestsPlayerIndex;
-                isDoingMinimalRequests = true;
-            }
+            const isBackupSearchStale = () => !VenoPlaybackAllowed || !streamInfo.IsShowingAd
+                || streamInfo.BreakGeneration !== backupSearchGeneration;
+            const discardStaleBackupSearch = () => {
+                const staleReason = !VenoPlaybackAllowed
+                    ? 'route left live-playback scope'
+                    : !streamInfo.IsShowingAd ? 'break ended' : 'newer break generation started';
+                console.log('[AD DEBUG] Discarded stale backup search (' + (backupPlayerType || 'no candidate') + ', ' + (Date.now() - backupSearchStart) + 'ms) — ' + staleReason);
+                return backupSearchInputM3u8;
+            };
             // Try pinned backup player type first if available
             const playerTypesToTry = PreferLowQualityBackup ? [...BackupPlayerTypes, 'autoplay'] : [...BackupPlayerTypes];
             if (streamInfo.PinnedBackupPlayerType) {
@@ -1451,7 +1659,29 @@ veno-twitch-stable.js text/javascript
                     }
                 }
             }
-            for (let playerTypeIndex = startIndex; !backupM3u8 && playerTypeIndex < playerTypesToTry.length; playerTypeIndex++) {
+            if (streamInfo.LastPlayerReload > Date.now() - PlayerReloadMinimalRequestsTime && playerTypesToTry.length > 0) {
+                // During the short reload burst, probe one named candidate rather than a
+                // stale numeric array position. Prefer an uncontaminated pinned type, then
+                // the named stable fallback, then the first uncontaminated candidate.
+                const isUncontaminated = (type) => type && playerTypesToTry.includes(type)
+                    && !(streamInfo.LoggedBackupAdsByType && streamInfo.LoggedBackupAdsByType.has(type));
+                const minimalPlayerType = isUncontaminated(streamInfo.PinnedBackupPlayerType)
+                    ? streamInfo.PinnedBackupPlayerType
+                    : isUncontaminated(PlayerReloadMinimalRequestsFallbackType)
+                        ? PlayerReloadMinimalRequestsFallbackType
+                        : playerTypesToTry.find(isUncontaminated) || PlayerReloadMinimalRequestsFallbackType;
+                const resolvedMinimalType = playerTypesToTry.includes(minimalPlayerType)
+                    ? minimalPlayerType
+                    : playerTypesToTry[0];
+                playerTypesToTry.splice(0, playerTypesToTry.length, resolvedMinimalType);
+                isDoingMinimalRequests = true;
+                console.log('[AD DEBUG] Post-reload minimal backup probe — trying named candidate ' + resolvedMinimalType);
+            }
+            backupPlayerTypeLoop:
+            for (let playerTypeIndex = 0; !backupM3u8 && playerTypeIndex < playerTypesToTry.length; playerTypeIndex++) {
+                if (Date.now() >= backupSearchDeadlineAt) {
+                    break;
+                }
                 const playerType = playerTypesToTry[playerTypeIndex];
                 const realPlayerType = playerType.replace('-CACHED', '');
                 const failedAt = streamInfo.FailedBackupPlayerTypes.get(realPlayerType);
@@ -1464,6 +1694,9 @@ veno-twitch-stable.js text/javascript
                 }
                 const isFullyCachedPlayerType = playerType != realPlayerType;
                 for (let i = 0; i < 2; i++) {
+                    if (Date.now() >= backupSearchDeadlineAt) {
+                        break backupPlayerTypeLoop;
+                    }
                     // This caches the m3u8 if it doesn't have ads. If the already existing cache has ads it fetches a new version (second loop)
                     let isFreshM3u8 = false;
                     let encodingsM3u8 = streamInfo.BackupEncodingsM3U8Cache[playerType];
@@ -1471,9 +1704,15 @@ veno-twitch-stable.js text/javascript
                         isFreshM3u8 = true;
                         backupColdTokenFetches++;
                         try {
-                            const accessTokenResponse = await getAccessToken(streamInfo.ChannelName, realPlayerType);
+                            const accessTokenResponse = await awaitWithDeadline(
+                                getAccessToken(streamInfo.ChannelName, realPlayerType),
+                                backupSearchDeadlineAt,
+                                'Access token request for ' + realPlayerType
+                            );
+                            if (isBackupSearchStale()) return discardStaleBackupSearch();
                             if (accessTokenResponse.status === 200) {
                                 const accessToken = await accessTokenResponse.json();
+                                if (isBackupSearchStale()) return discardStaleBackupSearch();
                                 // Twitch returns streamPlaybackAccessToken in two observed shapes:
                                 //   { data: { streamPlaybackAccessToken: {...} } } (most player types)
                                 //   { streamPlaybackAccessToken: {...} } (flatter, observed for 'embed')
@@ -1493,18 +1732,35 @@ veno-twitch-stable.js text/javascript
                                 const urlInfo = new URL('https://usher.ttvnw.net/api/' + (V2API ? 'v2/' : '') + 'channel/hls/' + streamInfo.ChannelName + '.m3u8' + streamInfo.UsherParams);
                                 urlInfo.searchParams.set('sig', spat.signature);
                                 urlInfo.searchParams.set('token', spat.value);
-                                const encodingsM3u8Response = await realFetch(urlInfo.href);
+                                const encodingsResult = await fetchAuxiliaryWithDeadline(
+                                    realFetch,
+                                    urlInfo.href,
+                                    undefined,
+                                    backupSearchDeadlineAt,
+                                    true,
+                                    'Backup master fetch for ' + realPlayerType
+                                );
+                                if (isBackupSearchStale()) return discardStaleBackupSearch();
+                                const encodingsM3u8Response = encodingsResult.response;
                                 if (encodingsM3u8Response.status === 200) {
-                                    encodingsM3u8 = streamInfo.BackupEncodingsM3U8Cache[playerType] = await encodingsM3u8Response.text();
-                                    // Reset detection diagnostic counter on success — token fetched, m3u8 fetched.
-                                    streamInfo.ConsecutiveTokenFetchFailures = 0;
-                                    streamInfo.LoggedTokenFailureStreak = false;
+                                    if (isUsableHlsPlaylist(encodingsResult.body, 'master')) {
+                                        encodingsM3u8 = encodingsResult.body;
+                                        streamInfo.BackupEncodingsM3U8Cache[playerType] = encodingsM3u8;
+                                        // Reset detection diagnostic counter on success — token fetched, valid m3u8 fetched.
+                                        streamInfo.ConsecutiveTokenFetchFailures = 0;
+                                        streamInfo.LoggedTokenFailureStreak = false;
+                                    } else {
+                                        console.log('[AD DEBUG] Backup master rejected for ' + realPlayerType + ' — response was not a usable HLS master playlist');
+                                        streamInfo.FailedBackupPlayerTypes.set(realPlayerType, Date.now());
+                                    }
                                 } else {
                                     console.log('[AD DEBUG] Usher HTTP ' + encodingsM3u8Response.status + ' for ' + realPlayerType);
+                                    streamInfo.FailedBackupPlayerTypes.set(realPlayerType, Date.now());
                                 }
                             } else {
                                 let errorBody = '';
                                 try { errorBody = ' — ' + (await accessTokenResponse.text()).substring(0, 200); } catch {}
+                                if (isBackupSearchStale()) return discardStaleBackupSearch();
                                 console.log('[AD DEBUG] Access token HTTP ' + accessTokenResponse.status + ' for ' + realPlayerType + (accessTokenResponse.status === 403 ? ' (integrity: ' + (ClientIntegrityHeader ? 'present' : 'missing') + ')' : '') + errorBody);
                                 streamInfo.FailedBackupPlayerTypes.set(realPlayerType, Date.now());
                                 streamInfo.ConsecutiveTokenFetchFailures = (streamInfo.ConsecutiveTokenFetchFailures || 0) + 1;
@@ -1514,7 +1770,8 @@ veno-twitch-stable.js text/javascript
                                 }
                             }
                         } catch (err) {
-                            console.log('[AD DEBUG] Access token failed for ' + realPlayerType + ': ' + err.message);
+                            if (isBackupSearchStale()) return discardStaleBackupSearch();
+                            console.log('[AD DEBUG] Backup setup failed for ' + realPlayerType + ': ' + err.message);
                             streamInfo.FailedBackupPlayerTypes.set(realPlayerType, Date.now());
                             streamInfo.ConsecutiveTokenFetchFailures = (streamInfo.ConsecutiveTokenFetchFailures || 0) + 1;
                             if (streamInfo.ConsecutiveTokenFetchFailures >= 3 && !streamInfo.LoggedTokenFailureStreak) {
@@ -1526,15 +1783,28 @@ veno-twitch-stable.js text/javascript
                     if (encodingsM3u8) {
                         try {
                             const streamM3u8Url = getStreamUrlForResolution(encodingsM3u8, currentResolution);
-                            const streamM3u8Response = await realFetch(streamM3u8Url);
+                            if (!streamM3u8Url) {
+                                throw new Error('backup master had no compatible media-playlist URL');
+                            }
+                            const streamResult = await fetchAuxiliaryWithDeadline(
+                                realFetch,
+                                streamM3u8Url,
+                                undefined,
+                                backupSearchDeadlineAt,
+                                true,
+                                'Backup media fetch for ' + playerType
+                            );
+                            if (isBackupSearchStale()) return discardStaleBackupSearch();
+                            const streamM3u8Response = streamResult.response;
                             if (streamM3u8Response.status == 200) {
-                                const m3u8Text = await streamM3u8Response.text();
-                                if (m3u8Text) {
+                                const m3u8Text = streamResult.body;
+                                if (isUsableHlsPlaylist(m3u8Text, 'media')) {
+                                    const backupHasAds = hasAdTags(m3u8Text);
                                     if (playerType == FallbackPlayerType) {
                                         fallbackM3u8 = m3u8Text;
                                     }
-                                    if ((!hasAdTags(m3u8Text) && (SimulatedAdsDepth == 0 || playerTypeIndex >= SimulatedAdsDepth - 1)) || (!fallbackM3u8 && playerTypeIndex >= playerTypesToTry.length - 1)) {
-                                        if ((streamInfo.ConsecutiveAllStrippedPolls || 0) >= 1 && !hasAdTags(m3u8Text)) {
+                                    if ((!backupHasAds && (SimulatedAdsDepth == 0 || playerTypeIndex >= SimulatedAdsDepth - 1)) || (!isDoingMinimalRequests && !fallbackM3u8 && playerTypeIndex >= playerTypesToTry.length - 1)) {
+                                        if ((streamInfo.ConsecutiveAllStrippedPolls || 0) >= 1 && !backupHasAds) {
                                             const prevType = streamInfo.LastCommittedBackupPlayerType;
                                             if (prevType && prevType !== playerType) {
                                                 console.log('[AD DEBUG] Cycle switched to different clean type (' + playerType + ', was ' + prevType + ') during freeze — recovered without reload');
@@ -1551,14 +1821,14 @@ veno-twitch-stable.js text/javascript
                                         backupM3u8 = m3u8Text;
                                         break;
                                     }
-                                    if (hasAdTags(m3u8Text)) {
+                                    if (backupHasAds) {
                                         if (!streamInfo.LoggedBackupAdsByType) streamInfo.LoggedBackupAdsByType = new Set();
                                         if (!streamInfo.LoggedBackupAdsByType.has(playerType)) {
                                             streamInfo.LoggedBackupAdsByType.add(playerType);
                                             console.log('[AD DEBUG] Backup stream (' + playerType + ') also has ads');
                                         }
                                     }
-                                    if (isFullyCachedPlayerType || isDoingMinimalRequests) {
+                                    if (isFullyCachedPlayerType) {
                                         backupPlayerType = playerType;
                                         backupM3u8 = m3u8Text;
                                         break;
@@ -1569,26 +1839,39 @@ veno-twitch-stable.js text/javascript
                                     // caused the v58 freeze regression (issue #112) because the strip+recovery
                                     // loop would engage even when a clean alternate was available on another
                                     // player type.
-                                    if (hasAdTags(m3u8Text) && playerTypeIndex >= playerTypesToTry.length - 1) {
+                                    if (backupHasAds && !isDoingMinimalRequests && playerTypeIndex >= playerTypesToTry.length - 1) {
                                         console.log('[AD DEBUG] All backup player types ad-laden — taking ' + playerType + ' as last-resort fallback (strip+recovery path will engage)');
                                         backupPlayerType = playerType;
                                         backupM3u8 = m3u8Text;
                                         break;
                                     }
+                                } else {
+                                    console.log('[AD DEBUG] Backup media rejected for ' + playerType + ' — response was not a usable HLS media playlist');
+                                    streamInfo.FailedBackupPlayerTypes.set(realPlayerType, Date.now());
                                 }
                             } else {
                                 console.log('[AD DEBUG] Backup stream fetch failed for ' + playerType + ' (status ' + streamM3u8Response.status + ')');
+                                streamInfo.FailedBackupPlayerTypes.set(realPlayerType, Date.now());
                             }
                         } catch (err) {
+                            if (isBackupSearchStale()) return discardStaleBackupSearch();
                             console.log('[AD DEBUG] Backup stream error for ' + playerType + ': ' + err.message);
                         }
                     }
                     streamInfo.BackupEncodingsM3U8Cache[playerType] = null;
+                    if (Date.now() >= backupSearchDeadlineAt) {
+                        break backupPlayerTypeLoop;
+                    }
                     if (isFreshM3u8) {
                         break;
                     }
                 }
             }
+            // The awaits above can outlive this ad break or even overlap a later break on
+            // the same stream. Once stale, return the exact incoming playlist immediately:
+            // do not commit a backup, strip segments, mutate early-reload state, or post a
+            // reload for an obsolete poll.
+            if (isBackupSearchStale()) return discardStaleBackupSearch();
             if (!backupM3u8 && fallbackM3u8) {
                 // Don't fall back to a type we've already marked contaminated this break.
                 // Without this guard, when all Source types go ad-laden mid-break the iteration
@@ -1611,17 +1894,16 @@ veno-twitch-stable.js text/javascript
             // would overwrite the cleared state and feed stale playlist data to the player,
             // causing buffer reconciliation failures and a forced reload. Check IsShowingAd
             // here to discard stale results.
-            if (backupM3u8 && streamInfo.IsShowingAd && streamInfo.BreakGeneration === backupSearchGeneration) {
+            if (backupM3u8) {
                 textStr = backupM3u8;
                 streamInfo.LastCommittedBackupPlayerType = backupPlayerType;
                 if (streamInfo.ActiveBackupPlayerType != backupPlayerType) {
                     streamInfo.ActiveBackupPlayerType = backupPlayerType;
-                    const sourceQualityTypes = ['embed', 'site', 'popout'];
                     // Never pin 'autoplay' — must stay at the last position in playerTypesToTry
                     // so the iteration-end last-resort branch commits it when all Source types
                     // are ad-laden (intended 360p clean fallback). Pinning would move it to
                     // position 0 and a different ad-laden Source type would be committed instead.
-                    if ((PinBackupPlayerType && backupPlayerType !== 'autoplay') || sourceQualityTypes.includes(backupPlayerType)) {
+                    if (PinBackupPlayerType && backupPlayerType !== 'autoplay') {
                         streamInfo.PinnedBackupPlayerType = backupPlayerType;
                     }
                     console.log(`[AD DEBUG] Blocking${(streamInfo.IsMidroll ? ' midroll ' : ' ')}ads (${backupPlayerType}) — backup found in ${Date.now() - backupSearchStart}ms${backupColdTokenFetches > 0 ? ` (cold cache: ${backupColdTokenFetches} token fetch${backupColdTokenFetches > 1 ? 'es' : ''})` : ' (warm cache)'}`);
@@ -1651,11 +1933,9 @@ veno-twitch-stable.js text/javascript
                         streamInfo.FastAutoplayConsecutive = 0;
                     }
                 }
-            } else if (backupM3u8 && (!streamInfo.IsShowingAd || streamInfo.BreakGeneration !== backupSearchGeneration)) {
-                const staleReason = !streamInfo.IsShowingAd ? 'break ended' : 'newer break generation started';
-                console.log('[AD DEBUG] Discarded stale backup commit (' + backupPlayerType + ', ' + (Date.now() - backupSearchStart) + 'ms) — ' + staleReason);
             } else {
-                console.log('[AD DEBUG] No ad-free backup stream found — ads may leak. Tried: ' + playerTypesToTry.slice(startIndex).join(', '));
+                const deadlineNote = Date.now() >= backupSearchDeadlineAt ? ' (search deadline reached)' : '';
+                console.log('[AD DEBUG] No ad-free backup stream found' + deadlineNote + ' — ads may leak. Tried: ' + playerTypesToTry.join(', '));
             }
             // TODO: Improve hevc stripping. It should always strip when there is a codec mismatch (both ways)
             const stripEnhanced = isEnhanced && streamInfo.ModifiedM3U8;
@@ -1726,12 +2006,16 @@ veno-twitch-stable.js text/javascript
                 if (!hasLiveSegments) {
                     console.log('[AD DEBUG] Backup stream has no live segments — forcing immediate reload');
                 }
+                const totalAllStrippedPollsThisBreak = streamInfo.TotalAllStrippedPolls || 0;
+                const earlyReloadCountThisBreak = streamInfo.EarlyReloadCount || 0;
+                const cycleRescuedThisBreak = !!streamInfo.CycleRescuedThisBreak;
+                const lastCommittedBackupPlayerType = streamInfo.LastCommittedBackupPlayerType;
                 const adBreakDurationSec = streamInfo.AdBreakStartedAt ? ((Date.now() - streamInfo.AdBreakStartedAt) / 1000).toFixed(1) : '?';
                 console.log('[AD DEBUG] Finished blocking ads — stripped ' + streamInfo.NumStrippedAdSegments + ' ad segments, duration: ' + adBreakDurationSec + 's');
-                if (streamInfo.TotalAllStrippedPolls > 0) {
+                if (totalAllStrippedPollsThisBreak > 0) {
                     const reloadInfo = streamInfo.EarlyReloadAtPoll ? ', early reload at poll ' + streamInfo.EarlyReloadAtPoll : '';
                     const wallClockFreeze = streamInfo.FreezeStartedAt ? ((Date.now() - streamInfo.FreezeStartedAt) / 1000).toFixed(1) + 's wall-clock' : 'unknown';
-                    console.log('[AD DEBUG] Ad break stats: ' + streamInfo.TotalAllStrippedPolls + ' all-stripped polls, freeze duration: ' + wallClockFreeze + reloadInfo);
+                    console.log('[AD DEBUG] Ad break stats: ' + totalAllStrippedPollsThisBreak + ' all-stripped polls, freeze duration: ' + wallClockFreeze + reloadInfo);
                 }
                 const hadStrippedSegments = streamInfo.NumStrippedAdSegments > 0;
                 // Only count toward false-positive guard if the m3u8 lacked high-confidence ad markers.
@@ -1766,34 +2050,35 @@ veno-twitch-stable.js text/javascript
                 streamInfo.EarlyReloadTriggered = false;
                 streamInfo.EarlyReloadAwaitingResult = false;
                 streamInfo.EarlyReloadAtPoll = 0;
-                streamInfo.TotalAllStrippedPolls = 0;
                 streamInfo.CsaiOnlyThisBreak = false;
                 streamInfo.EscapeHatchFired = false;
                 streamInfo.HasLoggedAdAttributes = false;
                 streamInfo.HasLoggedUnknownSignifiers = false;
                 streamInfo.LoggedFastAutoplayThisBreak = false;
                 streamInfo.LoggedFastAutoplayReprobeThisBreak = false;
-                // CSAI-only ad break: no segments were stripped — skip reload entirely.
+                // No-strip break: clear backup state and only transition the player when a
+                // backup player type was actually committed during this break.
                 if (!hadStrippedSegments) {
-                    console.log('[AD DEBUG] CSAI-only ad break (stripped 0) — clearing backup without player action');
+                    console.log('[AD DEBUG] No-strip ad break — clearing backup state');
                     streamInfo.IsUsingModifiedM3U8 = false;
-                    // Exception: if ANY backup was committed during this break (escape hatch
-                    // or cycle rescue that didn't meet cycleRescuedCleanly criteria), the
-                    // MediaSource buffer has accumulated mixed-source segments (backup-fetched
-                    // via alternate player-type access token + native-fetched). Mixing can
-                    // cause audio/video track timestamps to diverge, and without a reload the
-                    // drift compounds across subsequent escape-hatch breaks. Force a hard reload
-                    // to flush the MediaSource buffer + refresh the access token.
-                    // For autoplay (360p) specifically, the reload also restores Source
-                    // quality (autoplay-scoped token only serves 360p variant ladder).
-                    if (streamInfo.LastCommittedBackupPlayerType) {
-                        const isAutoplay = streamInfo.LastCommittedBackupPlayerType === 'autoplay';
-                        const reason = isAutoplay ? 'autoplay (360p) — restoring Source quality' : streamInfo.LastCommittedBackupPlayerType + ' — flushing MediaSource to prevent A/V desync accumulation';
+                    // A committed backup still needs a transition back to the native source.
+                    // No-strip Source-tier swaps can use the configured soft transition; an
+                    // autoplay token must stay hard so Source quality and its token are restored.
+                    if (lastCommittedBackupPlayerType) {
+                        const isAutoplay = lastCommittedBackupPlayerType === 'autoplay';
+                        const reloadKind = SoftReloadNoStrip && !isAutoplay ? 'post-ad' : 'early';
+                        const reason = isAutoplay
+                            ? 'autoplay (360p) — restoring Source quality'
+                            : reloadKind === 'post-ad'
+                                ? lastCommittedBackupPlayerType + ' — clearing no-strip backup with a soft transition'
+                                : lastCommittedBackupPlayerType + ' — flushing MediaSource after configured hard transition';
                         console.log('[AD DEBUG] End-of-break reload: ' + reason);
                         streamInfo.LastPlayerReload = Date.now();
                         if (!streamInfo.ReloadTimestamps) streamInfo.ReloadTimestamps = [];
                         streamInfo.ReloadTimestamps.push(Date.now());
-                        postMessage({ key: 'ReloadPlayer', kind: 'early' });
+                        postMessage({ key: 'ReloadPlayer', kind: reloadKind });
+                    } else {
+                        console.log('[AD DEBUG] No backup was committed — no player transition needed');
                     }
                 } else {
                 // Auto-escalate cooldown: if 3+ reloads in last 5 min, triple the cooldown
@@ -1807,9 +2092,9 @@ veno-twitch-stable.js text/javascript
                 // and no early reload was needed. The player is on a healthy backup stream
                 // — reloading just to return to the canonical player type causes an unnecessary
                 // ~1-2s loading circle.
-                const cycleRescuedCleanly = streamInfo.CycleRescuedThisBreak &&
-                    (streamInfo.TotalAllStrippedPolls || 0) <= 2 &&
-                    (streamInfo.EarlyReloadCount || 0) === 0;
+                const cycleRescuedCleanly = cycleRescuedThisBreak &&
+                    totalAllStrippedPollsThisBreak <= 2 &&
+                    earlyReloadCountThisBreak === 0;
                 if (cycleRescuedCleanly) {
                     console.log('[AD DEBUG] Cycle rescue handled the break cleanly — skipping end-of-break reload');
                 }
@@ -1822,14 +2107,9 @@ veno-twitch-stable.js text/javascript
                     streamInfo.ReloadTimestamps.push(Date.now());
                     streamInfo.IsUsingModifiedM3U8 = false;
                     streamInfo.LastPlayerReload = Date.now();
-                    // Issue #129 mode D: when the break stripped NO segments (BackupSwapFirst CSAI swap),
-                    // nothing was injected into the MediaSource, so the hard-reload flush is unnecessary and
-                    // just pays the desktop black-screen + play-icon teardown — use a soft reload ('post-ad')
-                    // there. Strip breaks stay hard ('early'). doTwitchPlayerTask maps 'post-ad' → soft.
-                    const reloadKind = (SoftReloadNoStrip && !hadStrippedSegments) ? 'post-ad' : 'early';
                     postMessage({
                         key: 'ReloadPlayer',
-                        kind: reloadKind
+                        kind: 'early'
                     });
                 } else {
                     if (tooSoonSinceLastReload) {
@@ -1840,6 +2120,13 @@ veno-twitch-stable.js text/javascript
                     });
                 }
                 }// end else (non-CSAI path)
+                // Clear per-break evidence only after every reload decision has consumed it.
+                streamInfo.LastCommittedBackupPlayerType = null;
+                streamInfo.CycleRescuedThisBreak = false;
+                streamInfo.TotalAllStrippedPolls = 0;
+                streamInfo.FreezeStartedAt = 0;
+                streamInfo.AdBreakStartedAt = 0;
+                streamInfo.EarlyReloadCount = 0;
             }
         }
         postMessage({
@@ -1940,10 +2227,21 @@ veno-twitch-stable.js text/javascript
     let playerForMonitoringBuffering = null;
     let driftCatchUpInterval = null;
     let driftCatchUpTimeout = null;
+    let driftCatchUpVideo = null;
+    function stopDriftCorrection() {
+        if (driftCatchUpInterval) clearInterval(driftCatchUpInterval);
+        if (driftCatchUpTimeout) clearTimeout(driftCatchUpTimeout);
+        driftCatchUpInterval = null;
+        driftCatchUpTimeout = null;
+        if (driftCatchUpVideo) {
+            try { driftCatchUpVideo.playbackRate = 1.0; } catch {}
+        }
+        driftCatchUpVideo = null;
+    }
     function startDriftCorrection(videoElement) {
-        if (DriftCorrectionRate <= 1) return;
-        if (driftCatchUpInterval) { clearInterval(driftCatchUpInterval); driftCatchUpInterval = null; }
-        if (driftCatchUpTimeout) { clearTimeout(driftCatchUpTimeout); driftCatchUpTimeout = null; }
+        if (DriftCorrectionRate <= 1 || !videoElement) return;
+        stopDriftCorrection();
+        driftCatchUpVideo = videoElement;
         videoElement.playbackRate = DriftCorrectionRate;
         console.log('[AD DEBUG] Drift correction: catching up at ' + DriftCorrectionRate + 'x');
         driftCatchUpInterval = setInterval(() => {
@@ -1951,18 +2249,14 @@ veno-twitch-stable.js text/javascript
                 const vid = getPlayerVideoElement();
                 if (vid && vid.buffered.length > 0) {
                     if (vid.buffered.end(vid.buffered.length - 1) - vid.currentTime <= 1) {
-                        vid.playbackRate = 1.0;
+                        stopDriftCorrection();
                         console.log('[AD DEBUG] Drift correction complete — resumed normal playback speed');
-                        clearInterval(driftCatchUpInterval); driftCatchUpInterval = null;
-                        if (driftCatchUpTimeout) { clearTimeout(driftCatchUpTimeout); driftCatchUpTimeout = null; }
                     }
                 }
-            } catch { clearInterval(driftCatchUpInterval); driftCatchUpInterval = null; }
+            } catch { stopDriftCorrection(); }
         }, 500);
         driftCatchUpTimeout = setTimeout(() => {
-            try { videoElement.playbackRate = 1.0; } catch {}
-            if (driftCatchUpInterval) { clearInterval(driftCatchUpInterval); driftCatchUpInterval = null; }
-            driftCatchUpTimeout = null;
+            stopDriftCorrection();
         }, 30000);
     }
     const playerBufferState = {
@@ -1982,20 +2276,104 @@ veno-twitch-stable.js text/javascript
         loggedPauseIntent: false,
         weJustPaused: 0,
         inAdBreak: false,
-        vaftEverUnmuted: false
+        vaftEverUnmuted: false,
+        videoElement: null,
+        videoCurrentTime: undefined,
+        hasHadData: false,
+        adStallStartAt: 0,
+        lastAdStallReloadAt: 0,
+        lastDriftStartedAt: 0,
+        wedgePrevInAdBreak: false,
+        wedgeEvalsRemaining: 0,
+        wedgeLastTime: -1,
+        wedgeLastFrames: -1,
+        wedgeEvidence: 0,
+        wedgeHealthy: 0,
+        wedgeActions: 0
     };
+    function resetPlayerObservationState(videoElement = null) {
+        stopDriftCorrection();
+        playerBufferState.hasStreamStarted = false;
+        playerBufferState.position = 0;
+        playerBufferState.videoCurrentTime = undefined;
+        playerBufferState.bufferedPosition = 0;
+        playerBufferState.bufferDuration = 0;
+        playerBufferState.numSame = 0;
+        playerBufferState.fixAttempts = 0;
+        playerBufferState.recoveryReloadUsed = false;
+        playerBufferState.videoElement = videoElement;
+        playerBufferState.hasHadData = false;
+        playerBufferState.adStallStartAt = 0;
+        playerBufferState.lastAdStallReloadAt = 0;
+        playerBufferState.lastDriftStartedAt = 0;
+        playerBufferState.wedgePrevInAdBreak = false;
+        playerBufferState.wedgeEvalsRemaining = 0;
+        playerBufferState.wedgeLastTime = -1;
+        playerBufferState.wedgeLastFrames = -1;
+        playerBufferState.wedgeEvidence = 0;
+        playerBufferState.wedgeHealthy = 0;
+        playerBufferState.wedgeActions = 0;
+    }
+    function resetPlayerRecoveryState(channelName = null, videoElement = null) {
+        resetPlayerObservationState(videoElement);
+        playerBufferState.channelName = channelName;
+        playerBufferState.lastFixTime = 0;
+        playerBufferState.isLive = false;
+        playerBufferState.lastBackupSwitchAt = 0;
+        playerBufferState.lastReloadAt = 0;
+        playerBufferState.userPauseIntent = false;
+        playerBufferState.loggedPauseIntent = false;
+        playerBufferState.weJustPaused = 0;
+        playerBufferState.inAdBreak = false;
+        isActivelyStrippingAds = false;
+    }
+    let playerMonitorTimerId = null;
+    function schedulePlayerBufferMonitor(delay) {
+        if (playerMonitorTimerId !== null) clearTimeout(playerMonitorTimerId);
+        playerMonitorTimerId = setTimeout(() => {
+            playerMonitorTimerId = null;
+            monitorPlayerBuffering();
+        }, Math.max(0, delay));
+    }
     // Poll the player state to detect and fix buffering caused by ad stream switching
     function monitorPlayerBuffering() {
+        const initiallyThrottled = typeof document !== 'undefined' && document.hidden
+            && !document.pictureInPictureElement && !playerBufferState.inAdBreak;
+        schedulePlayerBufferMonitor(initiallyThrottled ? PlayerBufferingDelay * 3 : PlayerBufferingDelay);
+        if (!isVenoPlaybackContextAllowed()) {
+            playerForMonitoringBuffering = null;
+            // Twitch reuses DOM nodes across SPA routes. Undo every display/mute/pause
+            // change owned by this script even if the old player root was disconnected.
+            restoreScriptHiddenMedia();
+            if (!monitorPlayerBuffering.routeSuppressed) {
+                window.VenoPlaybackAllowed = false;
+                postTwitchWorkerMessage('UpdateRouteAllowed', false);
+                resetPlayerRecoveryState();
+                updateAdblockBanner({ hasAds: false, isStrippingAdSegments: false });
+                monitorPlayerBuffering.routeSuppressed = true;
+            }
+            return;
+        }
+        if (monitorPlayerBuffering.routeSuppressed) {
+            window.VenoPlaybackAllowed = true;
+            postTwitchWorkerMessage('UpdateRouteAllowed', true);
+        }
+        monitorPlayerBuffering.routeSuppressed = false;
         // Fresh player lookup every tick (avoids stale ref when Twitch restarts its own player)
         playerForMonitoringBuffering = null;
         {
             const playerAndState = getPlayerAndState();
-            if (playerAndState && playerAndState.player && playerAndState.state) {
-                playerForMonitoringBuffering = {
-                    player: playerAndState.player,
-                    state: playerAndState.state
-                };
+            if (playerAndState && playerAndState.player) {
                 const video = playerAndState.player.getHTMLVideoElement?.();
+                // A standalone ad <video> can be recycled into the primary player without
+                // changing its source first. Primary-player identity is sufficient evidence
+                // to undo only the state that this script previously applied.
+                if (video?.dataset?.tasAdHidden) restoreHiddenAdVideo(video);
+                if (video && playerBufferState.videoElement && playerBufferState.videoElement !== video) {
+                    resetPlayerObservationState(video);
+                } else if (video) {
+                    playerBufferState.videoElement = video;
+                }
                 if (video && !video.__tasIntentHooked) {
                     video.__tasIntentHooked = true;
                     video.addEventListener('pause', () => {
@@ -2008,43 +2386,50 @@ veno-twitch-stable.js text/javascript
                         playerBufferState.loggedPauseIntent = false;
                     });
                 }
+                if (playerAndState.state) {
+                    playerForMonitoringBuffering = {
+                        player: playerAndState.player,
+                        state: playerAndState.state
+                    };
+                }
             }
         }
         if (playerForMonitoringBuffering) {
             try {
                 const player = playerForMonitoringBuffering.player;
                 const state = playerForMonitoringBuffering.state;
-                if (!player.core) {
-                    playerForMonitoringBuffering = null;
-                } else if (state.props?.content?.type === 'live' && !player.isPaused() && !player.getHTMLVideoElement()?.ended && (player.getHTMLVideoElement()?.readyState ?? 0) >= 1 && playerBufferState.lastFixTime <= Date.now() - PlayerBufferingMinRepeatDelay && !isActivelyStrippingAds && !playerBufferState.inAdBreak && (!playerBufferState.lastReloadAt || Date.now() - playerBufferState.lastReloadAt >= 15000) && (!playerBufferState.lastBackupSwitchAt || Date.now() - playerBufferState.lastBackupSwitchAt >= 10000)) {
+                const isLiveContent = state.props?.content?.type === 'live';
+                const observedVideo = player.getHTMLVideoElement?.();
+                // Resolve the channel identity before the health/recovery gates below. In particular,
+                // stale ad-break state from the previous channel must not prevent a SPA channel change
+                // from resetting all transient recovery state.
+                if (player.core && isLiveContent) {
                     const m3u8Url = player.core?.state?.path;
                     if (m3u8Url) {
-                      const lastSlash = m3u8Url.lastIndexOf('/');
-                      const queryStart = m3u8Url.indexOf('?', lastSlash);
-                      const fileName = m3u8Url.substring(lastSlash + 1, queryStart !== -1 ? queryStart : undefined);
-                      if (fileName?.endsWith('.m3u8')) {
-                          const channelName = fileName.slice(0, -5);
-                          if (playerBufferState.channelName != channelName) {
-                              playerBufferState.channelName = channelName;
-                              playerBufferState.hasStreamStarted = false;
-                              playerBufferState.numSame = 0;
-                              playerBufferState.fixAttempts = 0;
-                              playerBufferState.recoveryReloadUsed = false;
-                              playerBufferState.userPauseIntent = false;
-                              playerBufferState.loggedPauseIntent = false;
-                          }
-                      }
+                        const lastSlash = m3u8Url.lastIndexOf('/');
+                        const queryStart = m3u8Url.indexOf('?', lastSlash);
+                        const fileName = m3u8Url.substring(lastSlash + 1, queryStart !== -1 ? queryStart : undefined);
+                        if (fileName?.endsWith('.m3u8')) {
+                            const channelName = fileName.slice(0, -5);
+                            if (playerBufferState.channelName != channelName) {
+                                resetPlayerRecoveryState(channelName, observedVideo || null);
+                            }
+                        }
                     }
-                    if (player.getState() === 'Playing') {
-                        playerBufferState.hasStreamStarted = true;
-                    }
+                }
+                if (isLiveContent && observedVideo && observedVideo.readyState >= 3) {
+                    playerBufferState.hasHadData = true;
+                }
+                if (!player.core) {
+                    playerForMonitoringBuffering = null;
+                } else if (isLiveContent && !player.isPaused() && !observedVideo?.ended && (observedVideo?.readyState ?? 0) >= 1 && playerBufferState.lastFixTime <= Date.now() - PlayerBufferingMinRepeatDelay && !isActivelyStrippingAds && !playerBufferState.inAdBreak && (!playerBufferState.lastReloadAt || Date.now() - playerBufferState.lastReloadAt >= 15000) && (!playerBufferState.lastBackupSwitchAt || Date.now() - playerBufferState.lastBackupSwitchAt >= 10000)) {
                     const position = player.core?.state?.position;
                     const bufferedPosition = player.core?.state?.bufferedPosition;
                     const bufferDuration = player.getBufferDuration();
                     // video.currentTime is the source of truth for actual playback progress —
                     // state.position updates in batches on reload-heavy channels and can
                     // appear frozen for ~12s while the video element advances smoothly.
-                    const videoEl = player.getHTMLVideoElement?.();
+                    const videoEl = observedVideo;
                     const videoCurrentTime = videoEl?.currentTime;
                     if (position !== undefined && bufferedPosition !== undefined) {
                         // NOTE: This could be improved. It currently lets the player fully eat the full buffer before it triggers pause/play
@@ -2059,11 +2444,13 @@ veno-twitch-stable.js text/javascript
                         // healthy. Detect the swap by element identity and clear counters so the
                         // ramp-up isn't counted as a stall.
                         if (videoEl && playerBufferState.videoElement && playerBufferState.videoElement !== videoEl) {
-                            playerBufferState.numSame = 0;
-                            playerBufferState.fixAttempts = 0;
-                            playerBufferState.recoveryReloadUsed = false;
+                            resetPlayerObservationState(videoEl);
+                        } else if (videoEl) {
+                            playerBufferState.videoElement = videoEl;
                         }
-                        playerBufferState.videoElement = videoEl;
+                        if (player.getState() === 'Playing') {
+                            playerBufferState.hasStreamStarted = true;
+                        }
                         const positionFrozen = (playerBufferState.position == position) &&
                             (playerBufferState.videoCurrentTime === undefined || playerBufferState.videoCurrentTime === videoCurrentTime);
                         if (playerNotActivelyPlaying) {
@@ -2168,6 +2555,7 @@ veno-twitch-stable.js text/javascript
             }
             playerBufferState.wedgePrevInAdBreak = wedgeInAd;
             if (!DisablePostBreakWedge && !wedgeInAd && (playerBufferState.wedgeEvalsRemaining || 0) > 0
+                && (typeof document === 'undefined' || !document.hidden || !!document.pictureInPictureElement)
                 && !playerBufferState.userPauseIntent && playerForMonitoringBuffering
                 && playerForMonitoringBuffering.state?.props?.content?.type === 'live') {
                 try {
@@ -2210,11 +2598,15 @@ veno-twitch-stable.js text/javascript
                                         const recentReload = playerBufferState.lastReloadAt && (Date.now() - playerBufferState.lastReloadAt) < 15000;
                                         console.log('[AD DEBUG] Post-break video wedge — playhead advancing at ' + t.toFixed(1) + 's but only ' + Math.max(0, framesDelta) + ' decoded frame(s) over ' + (t - prevT).toFixed(1) + 's (audio-alive/video-frozen after break) — ' + (wedgeReload ? 'hard reload' : 'pause/play nudge') + ' (mirrors TTV-AB v12.0.0)');
                                         if (wedgeReload) {
-                                            playerBufferState.wedgeEvalsRemaining = 0;
                                             if (!recentReload) {
-                                                doTwitchPlayerTask(false, true, 'early');
+                                                playerBufferState.wedgeEvalsRemaining = 0;
+                                                doTwitchPlayerTask(false, true, 'early', { force: true, reason: 'confirmed-wedge' });
                                             } else {
-                                                console.log('[AD DEBUG] Post-break wedge reload SUPPRESSED — a reload fired <15s ago; relying on it');
+                                                // The break-end transition itself may have reloaded the player just
+                                                // before wedge evidence became conclusive. Keep the bounded detector
+                                                // armed so it can retry after cooldown if frames remain frozen.
+                                                playerBufferState.wedgeActions = 1;
+                                                console.log('[AD DEBUG] Post-break wedge reload DEFERRED — a reload fired <15s ago; detector remains armed');
                                             }
                                         } else {
                                             doTwitchPlayerTask(true, false);
@@ -2273,6 +2665,10 @@ veno-twitch-stable.js text/javascript
         } else if (!isActivelyStrippingAds && playerBufferState.adStallStartAt) {
             playerBufferState.adStallStartAt = 0;
         }
+        // Reuse this monitor for deferred worker-crash recovery. Running after route,
+        // channel, pause, PiP, and other recovery state has been refreshed avoids acting
+        // on a player that belongs to the route/channel we just left.
+        try { pendingWorkerCrashRecovery?.(); } catch {}
         const isLive = playerForMonitoringBuffering?.state?.props?.content?.type === 'live';
         if (playerBufferState.isLive && !isLive) {
             updateAdblockBanner({
@@ -2284,9 +2680,8 @@ veno-twitch-stable.js text/javascript
         if (typeof document !== 'undefined' && !monitorPlayerBuffering.visibilityHooked) {
             monitorPlayerBuffering.visibilityHooked = true;
             document.addEventListener('visibilitychange', () => {
-                if (!document.hidden && !monitorPlayerBuffering.pendingTick) {
-                    monitorPlayerBuffering.pendingTick = true;
-                    setTimeout(() => { monitorPlayerBuffering.pendingTick = false; monitorPlayerBuffering(); }, 100);
+                if (!document.hidden) {
+                    schedulePlayerBufferMonitor(100);
                 }
             });
         }
@@ -2303,13 +2698,14 @@ veno-twitch-stable.js text/javascript
         // background media deprioritization is browser-level. Negligible cost — only polls faster while hidden + in-break.
         const shouldThrottle = typeof document !== 'undefined' && document.hidden && !document.pictureInPictureElement && !playerBufferState.inAdBreak;
         const nextDelay = shouldThrottle ? PlayerBufferingDelay * 3 : PlayerBufferingDelay;
-        setTimeout(monitorPlayerBuffering, nextDelay);
+        schedulePlayerBufferMonitor(nextDelay);
     }
     // document.querySelector('video') returns the first <video> in the DOM, which since
     // July 2026 can be a separate Twitch ad element beside the player or in chat (#249).
     // Skip anything the guard below has marked, so mute/playbackRate work always lands on
     // the real player instead of being aimed at — or skipped because of — an ad element.
     function getPlayerVideoElement() {
+        if (!isVenoPlaybackContextAllowed()) return null;
         try {
             const monitored = playerForMonitoringBuffering?.player?.getHTMLVideoElement?.();
             if (monitored && monitored.isConnected && !monitored.dataset.tasAdHidden) return monitored;
@@ -2318,7 +2714,7 @@ veno-twitch-stable.js text/javascript
             const fresh = getPlayerAndState()?.player?.getHTMLVideoElement?.();
             if (fresh && fresh.isConnected && !fresh.dataset.tasAdHidden) return fresh;
         } catch {}
-        // Prefer video nodes inside Twitch's actual player root before scanning the whole page.
+        // Only fall back to video nodes inside Twitch's actual player root.
         try {
             const playerRoot = cachedPlayerRootDiv?.isConnected
                 ? cachedPlayerRootDiv
@@ -2328,12 +2724,49 @@ veno-twitch-stable.js text/javascript
                 if (!playerVideos[i].dataset.tasAdHidden) return playerVideos[i];
             }
         } catch {}
-        // Last-resort fallback for React/class-name drift: first non-ad-marked video only.
-        const videos = document.getElementsByTagName('video');
-        for (let i = 0; i < videos.length; i++) {
-            if (!videos[i].dataset.tasAdHidden) return videos[i];
-        }
+        // No whole-document fallback: unrelated chat/preview videos must remain untouched.
         return null;
+    }
+    function restoreHiddenAdVideo(video) {
+        if (!video?.dataset?.tasAdHidden) return false;
+        const previous = hiddenAdVideoState.get(video);
+        delete video.dataset.tasAdHidden;
+        if (previous) {
+            if (previous.display) {
+                video.style.setProperty('display', previous.display, previous.displayPriority || '');
+            } else {
+                video.style.removeProperty('display');
+            }
+            try {
+                video.muted = previous.muted;
+                if (!previous.paused && video.paused) video.play?.()?.catch?.(() => {});
+            } catch {}
+            hiddenAdVideoState.delete(video);
+        } else {
+            video.style.removeProperty('display');
+        }
+        console.log('[AD DEBUG] Restored recycled <video> to its pre-hide state (#249)');
+        return true;
+    }
+    function restoreScriptHiddenMedia() {
+        try {
+            const videos = document.getElementsByTagName('video');
+            for (let i = 0; i < videos.length; i++) restoreHiddenAdVideo(videos[i]);
+        } catch {}
+        try {
+            const overlays = document.querySelectorAll('[data-tas-hidden="1"]');
+            for (let i = 0; i < overlays.length; i++) {
+                const overlay = overlays[i];
+                const previous = hiddenAdOverlayState.get(overlay);
+                delete overlay.dataset.tasHidden;
+                if (previous?.display) {
+                    overlay.style.setProperty('display', previous.display, previous.displayPriority || '');
+                } else {
+                    overlay.style.removeProperty('display');
+                }
+                hiddenAdOverlayState.delete(overlay);
+            }
+        } catch {}
     }
     // Hide Twitch's ad break / Turbo promo / stream display ad overlays when we're already blocking ads
     function hideTwitchAdOverlays() {
@@ -2342,7 +2775,11 @@ veno-twitch-stable.js text/javascript
         const sdaElements = document.querySelectorAll('[data-test-selector="sda-wrapper"]');
         for (let i = 0; i < sdaElements.length; i++) {
             if (!sdaElements[i].dataset.tasHidden) {
-                sdaElements[i].dataset.tasHidden = '';
+                hiddenAdOverlayState.set(sdaElements[i], {
+                    display: sdaElements[i].style.getPropertyValue('display'),
+                    displayPriority: sdaElements[i].style.getPropertyPriority('display')
+                });
+                sdaElements[i].dataset.tasHidden = '1';
                 sdaElements[i].style.setProperty('display', 'none', 'important');
                 if (!loggedSdaHide) {
                     loggedSdaHide = true;
@@ -2376,6 +2813,7 @@ veno-twitch-stable.js text/javascript
                 if (!hiddenAdVideoState.has(vid)) {
                     hiddenAdVideoState.set(vid, {
                         muted: !!vid.muted,
+                        paused: !!vid.paused,
                         display: vid.style.getPropertyValue('display'),
                         displayPriority: vid.style.getPropertyPriority('display')
                     });
@@ -2387,27 +2825,16 @@ veno-twitch-stable.js text/javascript
                     vid.dataset.tasAdHidden = '1';
                     console.log('[AD DEBUG] Hidden separate Twitch video ad (' + adHost + ') — issue #249');
                 }
-            } else if (vid.dataset.tasAdHidden && !adHost) {
+            } else if (vid.dataset.tasAdHidden && (!adHost || vid === primaryVideo)) {
                 // Twitch recycles video nodes. Restore the exact state that existed before WE hid it;
                 // never force-unmute a node merely because Twitch changed its source.
-                const previous = hiddenAdVideoState.get(vid);
-                delete vid.dataset.tasAdHidden;
-                if (previous) {
-                    if (previous.display) {
-                        vid.style.setProperty('display', previous.display, previous.displayPriority || '');
-                    } else {
-                        vid.style.removeProperty('display');
-                    }
-                    try { vid.muted = previous.muted; } catch {}
-                    hiddenAdVideoState.delete(vid);
-                } else {
-                    vid.style.removeProperty('display');
-                }
-                console.log('[AD DEBUG] Restored recycled <video> to its pre-hide state (#249)');
+                restoreHiddenAdVideo(vid);
             }
         }
     }
     function updateAdblockBanner(data) {
+        const hasAds = isVenoPlaybackContextAllowed() && !!data.hasAds;
+        isActivelyStrippingAds = hasAds && !!data.isStrippingAdSegments;
         if (!cachedPlayerRootDiv || !cachedPlayerRootDiv.isConnected) {
             cachedPlayerRootDiv = document.querySelector('.video-player');
         }
@@ -2424,11 +2851,14 @@ veno-twitch-stable.js text/javascript
                 playerRootDiv.appendChild(adBlockDiv);
             }
             if (adBlockDiv != null) {
-                isActivelyStrippingAds = data.isStrippingAdSegments;
-                adBlockDiv.P.textContent = 'Blocking' + (data.isMidroll ? ' midroll' : '') + ' ads' + (data.isStrippingAdSegments ? ' (stripping)' : '') + (data.activeBackupPlayerType ? ' (' + data.activeBackupPlayerType + ')' : '');
-                adBlockDiv.style.display = data.hasAds && playerBufferState.isLive ? 'block' : 'none';
+                const bannerText = adBlockDiv.P || adBlockDiv.querySelector('p');
+                if (bannerText) {
+                    adBlockDiv.P = bannerText;
+                    bannerText.textContent = 'Blocking' + (data.isMidroll ? ' midroll' : '') + ' ads' + (isActivelyStrippingAds ? ' (stripping)' : '') + (data.activeBackupPlayerType ? ' (' + data.activeBackupPlayerType + ')' : '');
+                }
+                adBlockDiv.style.display = hasAds && playerBufferState.isLive ? 'block' : 'none';
             }
-            if (data.hasAds) {
+            if (hasAds) {
                 hideTwitchAdOverlays();
             }
         }
@@ -2451,7 +2881,7 @@ veno-twitch-stable.js text/javascript
         }
         function findReactRootNode() {
             let reactRootNode = null;
-            if (!cachedRootNode) {
+            if (!cachedRootNode || !cachedRootNode.isConnected) {
                 cachedRootNode = document.querySelector('#root');
             }
             const rootNode = cachedRootNode;
@@ -2533,21 +2963,28 @@ veno-twitch-stable.js text/javascript
         try { return localStorage.getItem('twitchAdSolutions_iosSoftReload') !== 'false'; } catch { return true; }
     })();
     // Pause/play or fully reload the Twitch player, preserving quality/volume settings
-    function doTwitchPlayerTask(isPausePlay, isReload, reloadKind) {
+    function doTwitchPlayerTask(isPausePlay, isReload, reloadKind, recoveryOptions = {}) {
+        if (!isVenoPlaybackContextAllowed()) return false;
+        const forceReload = isReload && recoveryOptions?.force === true;
+        const isEarlyReload = isReload && reloadKind === 'early';
+        const isPostAdReload = isReload && reloadKind === 'post-ad';
+        const recoveryReason = typeof recoveryOptions?.reason === 'string'
+            ? recoveryOptions.reason
+            : 'unspecified';
         const playerAndState = getPlayerAndState();
         if (!playerAndState) {
             console.log('Could not find react root');
-            return;
+            return false;
         }
         const player = playerAndState.player;
         const playerState = playerAndState.state;
         if (!player) {
             console.log('Could not find player');
-            return;
+            return false;
         }
-        if (!playerState) {
+        if (isReload && !playerState) {
             console.log('Could not find player state');
-            return;
+            return false;
         }
         const wasPaused = player.isPaused() || player.core?.paused;
         if (wasPaused) {
@@ -2557,13 +2994,13 @@ veno-twitch-stable.js text/javascript
                     playerBufferState.loggedPauseIntent = true;
                     console.log('[AD DEBUG] Respecting user pause intent — skipping auto-resume');
                 }
-                return;
+                return false;
             }
             // If WE recently called pause/play and player is still paused, retry play (stuck from autoplay policy or ad-state interference)
-            if (playerBufferState.weJustPaused && (Date.now() - playerBufferState.weJustPaused) < 10000) {
+            if (!forceReload && playerBufferState.weJustPaused && (Date.now() - playerBufferState.weJustPaused) < 10000) {
                 try { player.play()?.catch?.(() => {}); } catch {}
             }
-            return;
+            if (!forceReload && !isPostAdReload) return false;
         }
         if (!wasPaused) {
             playerBufferState.weJustPaused = 0;
@@ -2571,19 +3008,27 @@ veno-twitch-stable.js text/javascript
         playerBufferState.lastFixTime = Date.now();
         playerBufferState.numSame = 0;
         if (isPausePlay) {
+            playerBufferState.weJustPaused = Date.now();
             player.pause();
             player.play()?.catch?.(() => {});
-            playerBufferState.weJustPaused = Date.now();
-            return;
+            return true;
         }
         if (isReload && document.pictureInPictureElement) {
+            playerBufferState.weJustPaused = Date.now();
             // Downgrade to pause/play to preserve PiP — setSrc exits PiP
             player.pause();
             player.play()?.catch?.(() => {});
             console.log('[AD DEBUG] Downgraded reload to pause/play to preserve PiP');
-            return;
+            return false;
         }
-        if (isReload) {
+        if ((forceReload || isEarlyReload) && playerBufferState.lastReloadAt
+            && (Date.now() - playerBufferState.lastReloadAt) < 15000) {
+            const reloadLabel = forceReload ? 'Forced recovery reload' : 'Automatic early reload';
+            console.log('[AD DEBUG] ' + reloadLabel + ' suppressed by 15s cooldown (' + recoveryReason + ')');
+            if (isEarlyReload) postTwitchWorkerMessage('ReloadSkipped');
+            return false;
+        }
+        if (isReload && !forceReload && !isPostAdReload) {
             // Skip reload if the player is already healthy — avoids disrupting smooth playback.
             // But if we're way behind live edge (e.g. after a long ad break), proceed with reload to reset latency.
             const video = player.getHTMLVideoElement?.();
@@ -2611,9 +3056,12 @@ veno-twitch-stable.js text/javascript
                 } else {
                     console.log('[AD DEBUG] Skipping reload — player healthy (readyState=' + video.readyState + ', playing, latency=' + latencySec.toFixed(1) + 's)');
                     postTwitchWorkerMessage('ReloadSkipped');
-                    return;
+                    return false;
                 }
             }
+        }
+        if (forceReload) {
+            console.log('[AD DEBUG] Forced recovery reload proceeding (' + recoveryReason + ')');
         }
         if (isReload) {
             const lsKeyQuality = 'video-quality';
@@ -2796,8 +3244,9 @@ veno-twitch-stable.js text/javascript
                     } catch {}
                 }, 3000);
             }
-            return;
+            return true;
         }
+        return false;
     }
     window.reloadTwitchPlayer = () => {
         doTwitchPlayerTask(false, true);
@@ -2809,6 +3258,9 @@ veno-twitch-stable.js text/javascript
     }
     async function handleWorkerFetchRequest(fetchRequest) {
         const requestId = fetchRequest?.id || '';
+        if (!isVenoPlaybackContextAllowed()) {
+            return { id: requestId, error: 'Worker bridge disabled outside live-playback scope' };
+        }
         let parsedBody = null;
         try {
             const target = new URL(fetchRequest?.url || '');
@@ -2843,19 +3295,29 @@ veno-twitch-stable.js text/javascript
             });
         } catch {}
 
-        // 5s AbortController timeout bounds worst-case wait when Twitch GQL hangs.
+        // Bound the complete Twitch GQL exchange, including response-body consumption.
         const controller = new AbortController();
         const timeoutMs = 5000;
-        const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
         try {
-            const response = await window.realFetch('https://gql.twitch.tv/gql', {
-                method: 'POST',
-                body: JSON.stringify(parsedBody),
-                headers: safeHeaders,
-                signal: controller.signal
-            });
-            clearTimeout(timeoutId);
-            const responseBody = await response.text();
+            const operation = (async () => {
+                const response = await window.realFetch('https://gql.twitch.tv/gql', {
+                    method: 'POST',
+                    body: JSON.stringify(parsedBody),
+                    headers: safeHeaders,
+                    signal: controller.signal
+                });
+                const body = await response.text();
+                return { response, body };
+            })();
+            const { response, body: responseBody } = await awaitWithDeadline(
+                operation,
+                Date.now() + timeoutMs,
+                'GQL fetch',
+                () => controller.abort()
+            );
+            if (!isVenoPlaybackContextAllowed()) {
+                return { id: requestId, error: 'Worker bridge disabled outside live-playback scope' };
+            }
             return {
                 id: requestId,
                 status: response.status,
@@ -2868,10 +3330,12 @@ veno-twitch-stable.js text/javascript
                 body: responseBody
             };
         } catch (error) {
-            clearTimeout(timeoutId);
+            const timedOut = error?.name === 'AbortError'
+                || error?.name === 'TimeoutError'
+                || error?.code === 'TAS_DEADLINE';
             return {
                 id: requestId,
-                error: error.name === 'AbortError'
+                error: timedOut
                     ? 'GQL fetch timeout (' + (timeoutMs / 1000) + 's)'
                     : error.message
             };
@@ -2903,6 +3367,7 @@ veno-twitch-stable.js text/javascript
         };
 
         window.fetch = maskAsNative(function(input, init) {
+            if (!isVenoPlaybackContextAllowed()) return realFetch.apply(this, arguments);
             const requestUrl = typeof input === 'string'
                 ? input
                 : (typeof URL !== 'undefined' && input instanceof URL)
@@ -2939,7 +3404,7 @@ veno-twitch-stable.js text/javascript
 
                 // Modify only confirmed LIVE PlaybackAccessToken packets. VODs and the
                 // picture-by-picture/chat player are deliberately left untouched.
-                if (ForceAccessTokenPlayerType && typeof init?.body === 'string'
+                if (isVenoPlaybackContextAllowed() && ForceAccessTokenPlayerType && typeof init?.body === 'string'
                     && init.body.includes('PlaybackAccessToken')) {
                     try {
                         const parsedBody = JSON.parse(init.body);
@@ -2949,7 +3414,7 @@ veno-twitch-stable.js text/javascript
                             const operation = String(packet?.operationName || '');
                             const variables = packet?.variables;
                             const playerType = String(variables?.playerType || '');
-                            const isPlaybackToken = operation.includes('PlaybackAccessToken');
+                            const isPlaybackToken = operation === 'PlaybackAccessToken';
                             const isLiveToken = variables?.isLive === true
                                 && variables?.isVod !== true
                                 && !variables?.vodID;
@@ -3126,7 +3591,7 @@ veno-twitch-stable.js text/javascript
     hookFetch();
     const realXHROpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = maskAsNative(function(method, url) {
-        if (typeof url === 'string' && url.includes('edge.ads.twitch.tv')) {
+        if (isVenoPlaybackContextAllowed() && typeof url === 'string' && url.includes('edge.ads.twitch.tv')) {
             const csaiType = url.includes('bp=midroll') ? 'midroll' : url.includes('bp=preroll') ? 'preroll' : 'unknown';
             countCsaiRequest(csaiType, 'xhr');
         }
@@ -3153,4 +3618,3 @@ veno-twitch-stable.js text/javascript
         postTwitchWorkerMessage('AllSegmentsAreAdSegments');
     };
 })();
-

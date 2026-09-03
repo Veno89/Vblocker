@@ -1,2 +1,2 @@
-! Veno Twitch Stability Fork 1.0.1
+! Veno Twitch Stability Fork 1.0.2
 twitch.tv##+js(veno-twitch-stable)
